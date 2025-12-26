@@ -1,1 +1,317 @@
+# ==============================================================================
+# 脚本名称: WGCNA_Ultimate_Pipeline_v6.R
+# 功能描述: 整合数据清洗、自动选参、网络构建、表型关联、特定基因分析、网络导出
+# ==============================================================================
 
+# 01. 环境与包加载 -------------------------------------------------------------
+library(WGCNA)
+library(tidyverse)
+library(ggplot2)
+library(ggrepel)
+library(cowplot)
+
+# --- [ 全局配置中心：请根据你的数据进行修改 ] ---
+config <- list(
+  # 1. 运行模式设置
+  # "full": 跑全流程; "restart": 跳过耗时计算加载RData; "export": 仅进行后期绘图导出
+  run_mode = "restart", 
+  project_prefix = "WGCNA_result", # 所有的输出文件都会以此开头
+  
+  # 2. 输入文件路径
+  fpkm_file  = "gene.TMM.EXPR.matrix",           # 基因表达矩阵文件
+  trait_file = "00Sample_information.txt", # 样本表型信息文件
+  
+  # 3. 差异基因(DEG)过滤 (可选)
+  use_deg_filter = TRUE,        # 是否只分析差异基因？TRUE/FALSE
+  deg_id_file    = "DEG_id.txt", # 如果上项为TRUE，请提供ID列表文件 (无表头，每行一个)
+  
+  # 4. 自动化动态基因过滤参数
+  min_exp_val      = 0.1,  # 表达量阈值: 低于此值认为不表达
+  min_presence_pct = 0.5,  # 样本比例: 基因需在至少 50% 的样本中表达
+  top_var_pct      = NULL, # 变异度筛选: 保留 MAD 前 25% 的基因 (设为 NULL 则保留全部)
+  
+  # 5. WGCNA 核心算法参数
+  power          = NULL,      # 设为 NULL 则自动选第一个 R^2 > 0.85 的值
+  networkType    = "unsigned", # 类型选择: "unsigned" (常用), "signed", "signed hybrid"
+  minModuleSize  = 30,        # 模块包含的最少基因数 (建议 20-50)
+  mergeCutHeight = 0.25,      # 模块合并阈值: 0.25 表示相关性 > 0.75 的模块会合并
+  maxBlockSize   = 30000,     # 内存控制: 16G内存设1w-2w, 32G以上可设3w+
+  nThreads       = 24,        # 计算线程数 (根据你的电脑性能调整)
+  
+  # 6. 特定基因/表型关联分析 (可选)
+  # 填入你最关心的基因ID或表型列名，设为 NULL 则跳过
+  focus_variable = "Plant_height", 
+  
+  # 7. Cytoscape 导出配置 (可选)
+  export_cytoscape = TRUE,           # 是否导出互作网络文件？
+  target_modules   = c("turquoise"), # 想导出的模块颜色 (可填多个，如 c("blue","red"))
+  edge_threshold   = 0.15,           # 权重阈值: 0.1-0.2常用，值越大网络越稀疏
+  
+  # 8. 绘图输出尺寸设置 (独立设置)
+  # --- 模块聚类树 (Dendrogram) ---
+  dendro_width     = 10,             # 宽度 (英寸)
+  dendro_height    = 8,              # 高度 (英寸) - 树图通常不需要太高
+  
+  # --- 模块-表型热图 (Heatmap) ---
+  heatmap_width    = 8,             # 宽度 (英寸) - 随表型数量(列数)调整
+  heatmap_height   = 12              # 高度 (英寸) - 随模块数量(行数)调整，模块多时调大此值
+)
+
+# 02. 数据准备与逻辑控制 -------------------------------------------------------
+options(stringsAsFactors = FALSE)
+enableWGCNAThreads(nThreads = config$nThreads)
+rdata_file <- paste0(config$project_prefix, "_Session.RData")
+
+if (config$run_mode == "full" || !file.exists(rdata_file)) {
+  message(">>> [模式: 全流程运行] 正在读取并清洗原始数据...")
+  
+  # 2.1 数据导入
+  gene_exp <- read.table(config$fpkm_file, header = T, sep = '\t', row.names = 1,check.names = F)
+  
+  # 2.2 DEG 过滤
+  if(config$use_deg_filter) {
+    deg_ids <- read.table(config$deg_id_file, header = F)$V1
+    gene_exp <- gene_exp[intersect(rownames(gene_exp), deg_ids), ]
+  }
+  
+  # 2.3 自动化过滤逻辑
+  min_samples <- ceiling(ncol(gene_exp) * config$min_presence_pct)
+  keep <- rowSums(gene_exp > config$min_exp_val) >= min_samples
+  gene_exp <- gene_exp[keep, ]
+  
+  if(!is.null(config$top_var_pct)) {
+    m_ad <- apply(gene_exp, 1, mad)
+    gene_exp <- gene_exp[rank(-m_ad) <= ceiling(nrow(gene_exp) * config$top_var_pct), ]
+  }
+  
+  datExpr <- as.data.frame(t(gene_exp)) #
+  gsg <- goodSamplesGenes(datExpr, verbose = 3)
+  if (!gsg$allOK) datExpr <- datExpr[gsg$goodSamples, gsg$goodGenes]
+  
+  # 2.4 自动计算 Power
+  if(is.null(config$power)) {
+    sft <- pickSoftThreshold(datExpr, powerVector = 1:20, networkType = config$networkType)
+    config$power <- sft$fitIndices$Power[which(sft$fitIndices$SFT.R.sq > 0.85)[1]]
+    if(is.na(config$power)) config$power <- sft$fitIndices$Power[which.max(sft$fitIndices$SFT.R.sq)]
+  }
+  
+  # 2.5 构建网络
+  net <- blockwiseModules(datExpr, power = config$power, networkType = config$networkType,
+                          TOMType = config$networkType, minModuleSize = config$minModuleSize,
+                          mergeCutHeight = config$mergeCutHeight, maxBlockSize = config$maxBlockSize,
+                          numericLabels = FALSE, saveTOMs = TRUE, nThreads = config$nThreads)
+  
+  # 保存中间结果供以后快速调用
+  save(net, datExpr, config, file = rdata_file)
+} else {
+  message(">>> [模式: 重启/挖掘模式] 正在加载已有的网络计算结果...")
+  load(rdata_file)
+}
+
+# 02.6 样本聚类树图与 Power 分布图 -------------------------------------------------
+# [新增]: 输出样本聚类树图，用于检查离群样本；输出 soft-threshold(power) 评估图。
+message(">>> 正在输出样本聚类树图与power分布图...")
+
+# --- 图: 样本聚类树图 (Sample clustering dendrogram) ---
+sampleTree <- hclust(dist(datExpr), method = "average")
+pdf(paste0(config$project_prefix, "_SampleClustering.pdf"), width = 12, height = 9)
+  par(cex = 0.8)
+  plot(sampleTree,
+       main = paste0(config$project_prefix, " Sample clustering dendrogram"),
+       sub = "",
+       xlab = "",
+       cex.main = 1.5)
+dev.off()
+
+# --- 图: soft-threshold(power) 评估图 (Scale independence & Mean connectivity) ---
+# 如果当前会话中没有 sft 对象（例如 restart 模式加载的RData里未保存），则重新计算用于绘图
+if(!exists("sft")) {
+  message(">>> 未检测到 sft 对象，正在重新计算 pickSoftThreshold 以绘制 power 分布图...")
+  sft <- pickSoftThreshold(datExpr, powerVector = 1:20, networkType = config$networkType)
+}
+
+fi <- sft$fitIndices
+powers <- if ("Power" %in% colnames(fi)) fi[, "Power"] else fi[, 1]
+sft_rsq <- if ("SFT.R.sq" %in% colnames(fi)) fi[, "SFT.R.sq"] else fi[, 2]
+slope <- if ("slope" %in% colnames(fi)) fi[, "slope"] else fi[, 3]
+mean_k <- if ("mean.k." %in% colnames(fi)) fi[, "mean.k."] else if ("mean.k" %in% colnames(fi)) fi[, "mean.k"] else fi[, 5]
+signed_rsq <- -sign(slope) * sft_rsq
+
+pdf(paste0(config$project_prefix, "_SoftThreshold_Power.pdf"), width = 9, height = 5)
+  par(mfrow = c(1,2))
+  cex1 <- 0.9
+  
+  plot(powers, signed_rsq,
+       xlab = "Soft Threshold (power)",
+       ylab = "Scale Free Topology Model Fit, signed R^2",
+       type = "n",
+       main = "Scale independence")
+  text(powers, signed_rsq, labels = powers, cex = cex1, col = "red")
+  abline(h = 0.85, col = "red")
+  abline(v = config$power, col = "blue", lty = 2)
+  
+  plot(powers, mean_k,
+       xlab = "Soft Threshold (power)",
+       ylab = "Mean Connectivity",
+       type = "n",
+       main = "Mean connectivity")
+  text(powers, mean_k, labels = powers, cex = cex1, col = "red")
+  abline(v = config$power, col = "blue", lty = 2)
+dev.off()
+
+# 重置绘图参数（避免影响后续绘图）
+par(mfrow = c(1,1))
+
+# 03. 核心关联分析与绘图 -------------------------------------------------------
+message(">>> 正在进行表型关联分析与绘图...")
+datTraits <- read.table(config$trait_file, header = T, sep = '\t', row.names = 1,check.names = F)
+common <- intersect(rownames(datExpr), rownames(datTraits))
+datTraits <- datTraits[common, , drop = FALSE]
+
+# 3.1 基础可视化 (拆分为两个独立文件)
+
+# --- 图1: 模块聚类树 (Dendrogram) ---
+# [修改]: 单独输出 Dendrogram，使用 dendro_width/height
+pdf(paste0(config$project_prefix, "_Dendrogram.pdf"), width = config$dendro_width, height = config$dendro_height)
+  plotDendroAndColors(net$dendrograms[[1]], net$colors, "Module", dendroLabels = F, addGuide = T)
+dev.off()
+
+# --- 图2: 模块-表型相关性热图 (Heatmap) ---
+# 计算相关性
+MEs <- net$MEs
+modTraitCor <- cor(MEs, datTraits, use = "p")
+modTraitP   <- corPvalueStudent(modTraitCor, nrow(datExpr))
+textMat     <- paste0(signif(modTraitCor, 2), "\n(", signif(modTraitP, 1), ")")
+dim(textMat) <- dim(modTraitCor)
+
+# [修改]: 单独输出 Heatmap，使用 heatmap_width/height
+pdf(paste0(config$project_prefix, "_Heatmap.pdf"), width = config$heatmap_width, height = config$heatmap_height)
+
+  par(mar = c(8, 12, 3, 3))
+  labeledHeatmap(Matrix = modTraitCor, 
+                 xLabels = names(datTraits), 
+                 yLabels = names(MEs), 
+                 ySymbols = names(MEs),     # 确保同时也传递给Symbol，双重保险
+                 colorLabels = FALSE,       # FALSE表示打印文字，而不是显示颜色块
+                 colors = blueWhiteRed(50), 
+                 textMatrix = textMat,
+                 setStdMargins = FALSE,     # 禁用自动边距，使用我们上面自定义的par设置
+                 cex.text = 0.5, 
+                 zlim = c(-1,1),            # 锁定颜色范围在-1到1之间
+                 main = paste(config$project_prefix, "Module-Trait Relationships"))
+dev.off()
+
+# 3.2 结果表格导出 ------------------------------------------------------------
+# [新增]: 导出关键结果表格文件，便于后续统计/作图/筛选 hub gene
+message(">>> 正在导出结果表格文件...")
+
+# 3.2.1 导出本次用于建网的表达矩阵与表型矩阵
+write.table(datExpr,
+            file = paste0(config$project_prefix, "_datExpr_cleaned.tsv"),
+            sep = "\t", quote = FALSE, row.names = TRUE, col.names = NA)
+write.table(datTraits,
+            file = paste0(config$project_prefix, "_datTraits_used.tsv"),
+            sep = "\t", quote = FALSE, row.names = TRUE, col.names = NA)
+
+# 3.2.2 导出每个基因所属模块
+gene_module <- data.frame(
+  GeneID      = names(net$colors),
+  ModuleColor = net$colors,
+  stringsAsFactors = FALSE
+)
+write.table(gene_module,
+            file = paste0(config$project_prefix, "_Gene_Module_Assignment.tsv"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+
+# 3.2.3 导出模块特征向量 (Module Eigengenes)
+MEs_out <- data.frame(Sample = rownames(MEs), MEs, check.names = FALSE)
+write.table(MEs_out,
+            file = paste0(config$project_prefix, "_ModuleEigengenes.tsv"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+
+# 3.2.4 导出模块-表型相关性矩阵与 P 值矩阵（同时导出长表格式，方便作图）
+write.table(modTraitCor,
+            file = paste0(config$project_prefix, "_ModuleTrait_Cor.tsv"),
+            sep = "\t", quote = FALSE, col.names = NA)
+write.table(modTraitP,
+            file = paste0(config$project_prefix, "_ModuleTrait_Pvalue.tsv"),
+            sep = "\t", quote = FALSE, col.names = NA)
+
+modTrait_long <- as.data.frame(modTraitCor) %>%
+  rownames_to_column("Module") %>%
+  pivot_longer(-Module, names_to = "Trait", values_to = "Correlation") %>%
+  left_join(
+    as.data.frame(modTraitP) %>%
+      rownames_to_column("Module") %>%
+      pivot_longer(-Module, names_to = "Trait", values_to = "Pvalue"),
+    by = c("Module", "Trait")
+  )
+write.table(modTrait_long,
+            file = paste0(config$project_prefix, "_ModuleTrait_Cor_Pvalue.long.tsv"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+
+# 3.2.5 导出基因-模块成员度 (kME) 表（可用于 hub gene 筛选）
+moduleMembership <- cor(datExpr, MEs, use = "p")
+MMPvalue <- corPvalueStudent(moduleMembership, nrow(datExpr))
+
+ME_names <- colnames(MEs)
+moduleNames_clean <- gsub("^ME", "", ME_names)
+colnames(moduleMembership) <- paste0("kME_", moduleNames_clean)
+colnames(MMPvalue)         <- paste0("p_kME_", moduleNames_clean)
+
+gene_kme <- data.frame(
+  GeneID      = rownames(moduleMembership),
+  ModuleColor = net$colors[rownames(moduleMembership)],
+  moduleMembership,
+  MMPvalue,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+# 若配置了 focus_variable，同时导出该性状的 Gene Significance (GS)
+if(!is.null(config$focus_variable) && config$focus_variable %in% names(datTraits)) {
+  gs   <- cor(datExpr, datTraits[, config$focus_variable, drop = FALSE], use = "p")
+  gs_p <- corPvalueStudent(gs, nrow(datExpr))
+  colnames(gs)   <- paste0("GS_", config$focus_variable)
+  colnames(gs_p) <- paste0("p_GS_", config$focus_variable)
+  gene_kme <- cbind(gene_kme, gs, gs_p)
+}
+
+write.table(gene_kme,
+            file = paste0(config$project_prefix, "_Gene_kME_Table.tsv"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+
+# 3.2.6 导出每个模块包含的基因数
+module_size <- as.data.frame(table(net$colors), stringsAsFactors = FALSE)
+colnames(module_size) <- c("ModuleColor", "GeneCount")
+module_size <- module_size %>% arrange(desc(GeneCount))
+write.table(module_size,
+            file = paste0(config$project_prefix, "_Module_GeneCounts.tsv"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+
+# 04. 扩展分析模块 -------------------------------------------------------------
+
+# 4.1 关注变量关联聚类分析
+if(!is.null(config$focus_variable) && config$focus_variable %in% names(datTraits)) {
+  message(">>> 正在生成特定变量聚类图: ", config$focus_variable)
+  MET <- orderMEs(cbind(net$MEs, datTraits[, config$focus_variable, drop=F]))
+  pdf(paste0(config$project_prefix, "_", config$focus_variable, "_Net.pdf"), width = 8, height = 8)
+    plotEigengeneNetworks(MET, "Eigengene dendrogram", plotHeatmaps = T, marHeatmap = c(6,6,2,2))
+  dev.off()
+}
+
+# 4.2 导出 Cytoscape 网络文件
+if(config$export_cytoscape) {
+  for(mod in config$target_modules) {
+    message(">>> 正在导出模块 [", mod, "] 的 Cytoscape 文件...")
+    genes <- names(net$colors)[net$colors == mod]
+    # 为节省内存，重新计算模块局部TOM
+    modTOM <- TOMsimilarityFromExpr(datExpr[, genes], power = config$power, networkType = config$networkType)
+    dimnames(modTOM) <- list(genes, genes)
+    exportNetworkToCytoscape(modTOM, edgeFile = paste0(config$project_prefix, "_", mod, "_Edges.txt"),
+                             nodeFile = paste0(config$project_prefix, "_", mod, "_Nodes.txt"),
+                             weighted = TRUE, threshold = config$edge_threshold)
+  }
+}
+
+message(">>> 恭喜！分析全部结束。")
